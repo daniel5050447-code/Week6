@@ -4,7 +4,8 @@
 ---------------------------------------------------------------------
  - 프레임워크 : FastAPI
  - LLM        : Gemini (langchain-google-genai 의 ChatGoogleGenerativeAI)
- - 임베딩     : OpenAI text-embedding-3-small (1536차원)
+ - 임베딩     : Google gemini-embedding-001 (output_dimensionality=1536)
+                → OpenAI 대신 Gemini API 키 하나로 LLM + 임베딩 모두 처리
  - 벡터 DB    : Supabase (pgvector) + LangChain SupabaseVectorStore
 
  [엔드포인트]
@@ -23,6 +24,7 @@
 
 import os
 import json
+import time
 import asyncio
 from io import BytesIO
 from typing import Any, AsyncGenerator, List, Optional
@@ -35,14 +37,18 @@ from pydantic import BaseModel, Field
 from pypdf import PdfReader
 from supabase import Client, create_client
 
+# Google GenAI SDK (임베딩 직접 호출용)
+from google import genai
+from google.genai import types
+
 # LangChain 관련 import
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.documents import Document
+from langchain_core.embeddings import Embeddings
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_openai import OpenAIEmbeddings
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_community.vectorstores import SupabaseVectorStore
 
@@ -51,14 +57,18 @@ from langchain_community.vectorstores import SupabaseVectorStore
 # 1. 환경변수 로드
 # =====================================================================
 # Cloud Run 에서는 콘솔/CLI 의 "환경 변수" 또는 Secret Manager 로 주입한다.
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")   # Gemini 호출용 키
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")   # OpenAI 임베딩용 키
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")   # Gemini LLM + 임베딩 공용 키
 SUPABASE_URL = os.getenv("SUPABASE_URL")       # 예: https://xxxx.supabase.co
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")       # service_role 키 권장 (insert/delete 권한 필요)
 
 # 모델명은 요구사항대로 기본값을 두되, 필요하면 환경변수로 바꿀 수 있게 열어둔다.
 LLM_MODEL = os.getenv("LLM_MODEL", "gemini-3.5-flash-lite")
-EMBEDDING_MODEL = "text-embedding-3-small"   # 1536 차원 → supabase.sql 의 vector(1536) 과 일치해야 함
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "gemini-embedding-001")
+
+# gemini-embedding-001 은 기본 3072차원이지만, output_dimensionality 로 줄일 수 있다.
+# 1536 으로 맞추면 supabase.sql 의 vector(1536) 을 그대로 쓸 수 있다. (SQL 수정 불필요)
+# ※ pgvector 의 HNSW 인덱스는 2000차원까지만 지원하므로 3072 는 쓰지 않는다.
+EMBEDDING_DIM = 1536
 
 # Supabase 테이블 / 함수 이름 (supabase.sql 과 동일하게 맞춰야 함)
 TABLE_NAME = "documents"
@@ -72,18 +82,73 @@ CHUNK_OVERLAP = 200
 TOP_K = 4
 
 # 임베딩/저장을 몇 개씩 묶어서 처리할지 (진행률 갱신 단위이기도 함)
+# Gemini 임베딩 API 는 한 요청에 최대 100개까지 가능 → 50 이면 안전
 EMBED_BATCH_SIZE = 50
 STORE_BATCH_SIZE = 100
 
 
 # =====================================================================
-# 2. 전역 객체 (지연 초기화)
+# 2. Gemini 임베딩 클래스 (LangChain Embeddings 인터페이스 구현)
+# =====================================================================
+class GeminiEmbeddings(Embeddings):
+    """
+    LangChain 의 Embeddings 인터페이스를 구현한 Gemini 임베딩 래퍼.
+    - SupabaseVectorStore 가 요구하는 embed_documents / embed_query 를 제공한다.
+    - 비동기 버전(aembed_documents / aembed_query)은 LangChain 기본 구현이
+      위의 동기 함수를 스레드에서 실행해준다.
+
+    task_type 을 구분하면 검색 품질이 좋아진다.
+      - 문서 저장용 : RETRIEVAL_DOCUMENT
+      - 질문 검색용 : RETRIEVAL_QUERY
+    """
+
+    def __init__(self, api_key: str, model: str, dim: int):
+        self.client = genai.Client(api_key=api_key)
+        self.model = model
+        self.dim = dim
+
+    def _embed(self, texts: List[str], task_type: str) -> List[List[float]]:
+        """
+        Gemini 임베딩 API 호출.
+        무료 등급은 분당 요청 수 제한(429)이 있으므로 지수 백오프로 재시도한다.
+        """
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                res = self.client.models.embed_content(
+                    model=self.model,
+                    contents=texts,
+                    config=types.EmbedContentConfig(
+                        task_type=task_type,
+                        output_dimensionality=self.dim,
+                    ),
+                )
+                return [list(e.values) for e in res.embeddings]
+            except Exception as e:
+                msg = str(e)
+                is_rate_limit = "429" in msg or "RESOURCE_EXHAUSTED" in msg
+                if is_rate_limit and attempt < max_retries - 1:
+                    time.sleep(2 ** attempt * 2)   # 2, 4, 8, 16초 대기 후 재시도
+                    continue
+                raise
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        """문서(청크) 여러 개 임베딩"""
+        return self._embed(texts, "RETRIEVAL_DOCUMENT")
+
+    def embed_query(self, text: str) -> List[float]:
+        """검색 질문 1개 임베딩"""
+        return self._embed([text], "RETRIEVAL_QUERY")[0]
+
+
+# =====================================================================
+# 3. 전역 객체 (지연 초기화)
 # =====================================================================
 # 환경변수가 하나라도 빠져 있으면 서버 자체가 죽지 않도록,
 # 실제로 필요할 때(첫 요청 시) 생성해서 재사용한다.
 # → /health 는 키가 없어도 응답 가능하므로 배포 직후 상태 점검이 쉬워진다.
 _supabase: Optional[Client] = None
-_embeddings: Optional[OpenAIEmbeddings] = None
+_embeddings: Optional[GeminiEmbeddings] = None
 _vector_store: Optional[SupabaseVectorStore] = None
 
 
@@ -93,7 +158,6 @@ def _require_env() -> None:
         name
         for name, value in {
             "GOOGLE_API_KEY": GOOGLE_API_KEY,
-            "OPENAI_API_KEY": OPENAI_API_KEY,
             "SUPABASE_URL": SUPABASE_URL,
             "SUPABASE_KEY": SUPABASE_KEY,
         }.items()
@@ -112,12 +176,12 @@ def get_supabase() -> Client:
     return _supabase
 
 
-def get_embeddings() -> OpenAIEmbeddings:
-    """OpenAI 임베딩 객체 싱글톤."""
+def get_embeddings() -> GeminiEmbeddings:
+    """Gemini 임베딩 객체 싱글톤."""
     global _embeddings
     if _embeddings is None:
         _require_env()
-        _embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL, api_key=OPENAI_API_KEY)
+        _embeddings = GeminiEmbeddings(api_key=GOOGLE_API_KEY, model=EMBEDDING_MODEL, dim=EMBEDDING_DIM)
     return _embeddings
 
 
@@ -152,9 +216,9 @@ def make_llm(streaming: bool = False, callbacks: Optional[list] = None) -> ChatG
 
 
 # =====================================================================
-# 3. FastAPI 앱 + CORS
+# 4. FastAPI 앱 + CORS
 # =====================================================================
-app = FastAPI(title="RAG Chatbot Server", version="1.0.0")
+app = FastAPI(title="RAG Chatbot Server", version="1.1.0")
 
 # 브라우저에서 직접 fetch 로 호출하므로 CORS 를 전체 허용한다.
 # (allow_credentials=True 와 "*" 는 함께 쓸 수 없으므로 False 로 둔다)
@@ -168,7 +232,7 @@ app.add_middleware(
 
 
 # =====================================================================
-# 4. 공통 유틸: SSE 포맷 & 스트리밍 응답
+# 5. 공통 유틸: SSE 포맷 & 스트리밍 응답
 # =====================================================================
 def sse(event: str, data: Any) -> str:
     """
@@ -193,7 +257,7 @@ def sse_response(generator: AsyncGenerator[str, None]) -> StreamingResponse:
 
 
 # =====================================================================
-# 5. 요청 바디 스키마 (Pydantic)
+# 6. 요청 바디 스키마 (Pydantic)
 # =====================================================================
 class PageText(BaseModel):
     """페이지 단위 텍스트 (출처 페이지 번호를 남기기 위해 사용)"""
@@ -225,7 +289,7 @@ class QueryRequest(BaseModel):
 
 
 # =====================================================================
-# 6. GET /health
+# 7. GET /health
 # =====================================================================
 @app.get("/health")
 async def health():
@@ -237,9 +301,9 @@ async def health():
         "status": "ok",
         "llm_model": LLM_MODEL,
         "embedding_model": EMBEDDING_MODEL,
+        "embedding_dim": EMBEDDING_DIM,
         "env": {
             "GOOGLE_API_KEY": bool(GOOGLE_API_KEY),
-            "OPENAI_API_KEY": bool(OPENAI_API_KEY),
             "SUPABASE_URL": bool(SUPABASE_URL),
             "SUPABASE_KEY": bool(SUPABASE_KEY),
         },
@@ -247,16 +311,12 @@ async def health():
 
 
 # =====================================================================
-# 7. POST /upload  (PDF → 텍스트)
+# 8. POST /upload  (PDF → 텍스트)
 # =====================================================================
 @app.post("/upload")
 async def upload(file: UploadFile = File(...)):
     """
     multipart/form-data 로 PDF 를 받아 pypdf 로 텍스트를 추출한다.
-
-    프론트 예시:
-        const fd = new FormData(); fd.append("file", pdfFile);
-        const res = await fetch(`${API}/upload`, { method: "POST", body: fd });
 
     응답:
         {
@@ -303,7 +363,7 @@ async def upload(file: UploadFile = File(...)):
 
 
 # =====================================================================
-# 8. POST /build  (청크 분할 → 임베딩 → Supabase 저장, 진행 현황 SSE)
+# 9. POST /build  (청크 분할 → 임베딩 → Supabase 저장, 진행 현황 SSE)
 # =====================================================================
 @app.post("/build")
 async def build(req: BuildRequest):
@@ -367,7 +427,10 @@ async def build(req: BuildRequest):
             vectors: List[List[float]] = []
             for start in range(0, total, EMBED_BATCH_SIZE):
                 batch = docs[start:start + EMBED_BATCH_SIZE]
-                vectors.extend(await embeddings.aembed_documents([d.page_content for d in batch]))
+                # Gemini SDK 호출은 동기 함수 → 스레드에서 실행해 이벤트 루프를 막지 않는다
+                vectors.extend(await asyncio.to_thread(
+                    embeddings.embed_documents, [d.page_content for d in batch]
+                ))
                 yield sse("progress", {
                     "stage": "embed", "current": len(vectors), "total": total,
                     "message": f"임베딩 중 ({len(vectors)}/{total})",
@@ -398,7 +461,7 @@ async def build(req: BuildRequest):
 
 
 # =====================================================================
-# 9. 스트리밍 콜백 핸들러
+# 10. 스트리밍 콜백 핸들러
 # =====================================================================
 class StreamHandler(BaseCallbackHandler):
     """
@@ -421,7 +484,7 @@ class StreamHandler(BaseCallbackHandler):
 
 
 # =====================================================================
-# 10. 프롬프트 정의
+# 11. 프롬프트 정의
 # =====================================================================
 # ① 질의 확장 (Query Augmentation) 프롬프트
 QUERY_AUG_SYSTEM = (
@@ -471,20 +534,11 @@ def format_docs(docs: List[Document]) -> str:
 
 
 # =====================================================================
-# 11. POST /query  (질의 확장 → 검색 → 답변 스트리밍)
+# 12. POST /query  (질의 확장 → 검색 → 답변 스트리밍)
 # =====================================================================
 @app.post("/query")
 async def query(req: QueryRequest):
     """
-    요청 바디:
-        {
-          "question": "그거 예산은 얼마야?",
-          "chat_history": [
-            {"role": "user", "content": "..."},
-            {"role": "assistant", "content": "..."}
-          ]
-        }
-
     SSE 이벤트 (순서대로):
         augmented_query : {"query": "확장된 질문"}
         sources         : [{"content": "...", "page": 3, "source": "a.pdf"}, ...]
@@ -567,10 +621,9 @@ async def query(req: QueryRequest):
 
 
 # =====================================================================
-# 12. 로컬 실행용 엔트리포인트
+# 13. 로컬 실행용 엔트리포인트
 # =====================================================================
 # Cloud Run 은 PORT 환경변수(기본 8080)로 포트를 알려준다.
-# Docker 에서는 Dockerfile 의 CMD 로 실행되지만, 로컬에서 `python main.py` 로도 띄울 수 있게 둔다.
 if __name__ == "__main__":
     import uvicorn
 
