@@ -98,6 +98,10 @@ EMBED_BATCH_SIZE = 50
 EMBED_RPM = int(os.getenv("EMBED_RPM", "90" if EMBEDDING_PROVIDER == "google" else "0"))
 EMBED_MAX_RETRIES = 6          # 429 발생 시 최대 재시도 횟수
 WAIT_TICK = 5                  # 대기 중 SSE 로 남은 시간을 알려주는 간격(초) → 연결 유지 효과도 있음
+# 임베딩 API 1회 호출 최대 대기 시간(초).
+#   SDK 내부 재시도/네트워크 문제로 응답이 오지 않으면 무한정 멈출 수 있으므로,
+#   이 시간을 넘기면 취소하고 재시도한다.
+EMBED_CALL_TIMEOUT = int(os.getenv("EMBED_CALL_TIMEOUT", "90"))
 STORE_BATCH_SIZE = 100
 
 
@@ -453,16 +457,43 @@ async def build(req: BuildRequest):
 
                 # (b) 임베딩 요청 + 429 발생 시 서버가 알려준 시간만큼 기다렸다 재시도
                 for attempt in range(1, EMBED_MAX_RETRIES + 1):
+                    # API 호출을 백그라운드 태스크로 실행하고,
+                    # 응답을 기다리는 동안 WAIT_TICK 초마다 heartbeat(wait 이벤트)를 보낸다.
+                    #  → 응답이 늦어도 SSE 연결이 '조용히' 멈추지 않고 진행 상황이 보인다.
+                    task = asyncio.create_task(
+                        embeddings.aembed_documents([d.page_content for d in batch])
+                    )
+                    started = time.monotonic()
+                    timed_out = False
+                    while not task.done():
+                        await asyncio.wait({task}, timeout=WAIT_TICK)
+                        if task.done():
+                            break
+                        elapsed = time.monotonic() - started
+                        if elapsed > EMBED_CALL_TIMEOUT:
+                            # 너무 오래 걸리면 취소하고 재시도 대상으로 처리
+                            task.cancel()
+                            timed_out = True
+                            break
+                        yield sse("wait", {
+                            "stage": "embed", "seconds": round(elapsed),
+                            "message": f"임베딩 응답 대기 중 ({round(elapsed)}초 경과, {len(vectors)}/{total})",
+                        })
+
                     try:
-                        result = await embeddings.aembed_documents([d.page_content for d in batch])
+                        if timed_out:
+                            raise TimeoutError(f"임베딩 API 응답 없음 ({EMBED_CALL_TIMEOUT}초 초과)")
+                        result = task.result()
                         break
                     except Exception as e:
-                        if not is_rate_limit_error(e) or attempt == EMBED_MAX_RETRIES:
-                            raise   # 할당량 문제가 아니거나 재시도 소진 → error 이벤트로
-                        delay = parse_retry_delay(e)
-                        async for ev in wait_with_countdown(
-                            delay, f"429 할당량 초과 (재시도 {attempt}/{EMBED_MAX_RETRIES - 1})"
-                        ):
+                        retryable = is_rate_limit_error(e) or isinstance(e, TimeoutError)
+                        if not retryable or attempt == EMBED_MAX_RETRIES:
+                            raise   # 재시도 대상이 아니거나 재시도 소진 → error 이벤트로
+                        if isinstance(e, TimeoutError):
+                            delay, reason = 5.0, f"응답 시간 초과 (재시도 {attempt}/{EMBED_MAX_RETRIES - 1})"
+                        else:
+                            delay, reason = parse_retry_delay(e), f"429 할당량 초과 (재시도 {attempt}/{EMBED_MAX_RETRIES - 1})"
+                        async for ev in wait_with_countdown(delay, reason):
                             yield ev
                         sent_log = []   # 대기 후에는 윈도우가 비워진 것으로 간주
 
