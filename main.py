@@ -4,8 +4,7 @@
 ---------------------------------------------------------------------
  - 프레임워크 : FastAPI
  - LLM        : Gemini (langchain-google-genai 의 ChatGoogleGenerativeAI)
- - 임베딩     : Google gemini-embedding-001 (output_dimensionality=1536)
-                → OpenAI 대신 Gemini API 키 하나로 LLM + 임베딩 모두 처리
+ - 임베딩     : OpenAI text-embedding-3-small (1536차원)
  - 벡터 DB    : Supabase (pgvector) + LangChain SupabaseVectorStore
 
  [엔드포인트]
@@ -23,6 +22,7 @@
 """
 
 import os
+import re
 import json
 import time
 import asyncio
@@ -37,19 +37,15 @@ from pydantic import BaseModel, Field
 from pypdf import PdfReader
 from supabase import Client, create_client
 
-# Google GenAI SDK (임베딩 직접 호출용)
-from google import genai
-from google.genai import types
-
 # LangChain 관련 import
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.documents import Document
-from langchain_core.embeddings import Embeddings
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_openai import OpenAIEmbeddings
+from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain_community.vectorstores import SupabaseVectorStore
 
 
@@ -57,18 +53,27 @@ from langchain_community.vectorstores import SupabaseVectorStore
 # 1. 환경변수 로드
 # =====================================================================
 # Cloud Run 에서는 콘솔/CLI 의 "환경 변수" 또는 Secret Manager 로 주입한다.
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")   # Gemini LLM + 임베딩 공용 키
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")   # Gemini 호출용 키
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")   # OpenAI 임베딩용 키
 SUPABASE_URL = os.getenv("SUPABASE_URL")       # 예: https://xxxx.supabase.co
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")       # service_role 키 권장 (insert/delete 권한 필요)
 
 # 모델명은 요구사항대로 기본값을 두되, 필요하면 환경변수로 바꿀 수 있게 열어둔다.
 LLM_MODEL = os.getenv("LLM_MODEL", "gemini-3.5-flash-lite")
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "gemini-embedding-001")
-
-# gemini-embedding-001 은 기본 3072차원이지만, output_dimensionality 로 줄일 수 있다.
-# 1536 으로 맞추면 supabase.sql 의 vector(1536) 을 그대로 쓸 수 있다. (SQL 수정 불필요)
-# ※ pgvector 의 HNSW 인덱스는 2000차원까지만 지원하므로 3072 는 쓰지 않는다.
+# ---------------------------------------------------------------------
+# 임베딩 제공자 선택
+#   EMBEDDING_PROVIDER = "google" (기본) → Gemini 임베딩 (GOOGLE_API_KEY 사용)
+#   EMBEDDING_PROVIDER = "openai"        → OpenAI text-embedding-3-small (OPENAI_API_KEY 사용)
+# 어느 쪽이든 결과는 1536 차원 → supabase.sql 의 vector(1536) 과 일치해야 한다.
+# ※ 제공자를 바꾸면 기존 벡터와 호환되지 않으므로 반드시 reset=true 로 다시 빌드할 것
+# ---------------------------------------------------------------------
+EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "google").lower()
 EMBEDDING_DIM = 1536
+if EMBEDDING_PROVIDER == "openai":
+    EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
+else:
+    # Gemini 임베딩은 기본 3072 차원 → output_dimensionality=1536 으로 줄여서 저장
+    EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "gemini-embedding-001")
 
 # Supabase 테이블 / 함수 이름 (supabase.sql 과 동일하게 맞춰야 함)
 TABLE_NAME = "documents"
@@ -82,73 +87,28 @@ CHUNK_OVERLAP = 200
 TOP_K = 4
 
 # 임베딩/저장을 몇 개씩 묶어서 처리할지 (진행률 갱신 단위이기도 함)
-# Gemini 임베딩 API 는 한 요청에 최대 100개까지 가능 → 50 이면 안전
 EMBED_BATCH_SIZE = 50
+
+# ---------------------------------------------------------------------
+# 임베딩 속도 제한 (Rate Limit) 대응
+#   Gemini 무료 티어는 "텍스트 1개 = 요청 1건"으로 계산해 분당 100건(RPM) 제한이 있다.
+#   → 1분에 EMBED_RPM 개 이하로만 보내도록 속도를 조절한다. (여유분 두고 90)
+#   유료 티어/OpenAI 처럼 한도가 넉넉하면 EMBED_RPM=0 으로 두면 제한 없이 보낸다.
+# ---------------------------------------------------------------------
+EMBED_RPM = int(os.getenv("EMBED_RPM", "90" if EMBEDDING_PROVIDER == "google" else "0"))
+EMBED_MAX_RETRIES = 6          # 429 발생 시 최대 재시도 횟수
+WAIT_TICK = 5                  # 대기 중 SSE 로 남은 시간을 알려주는 간격(초) → 연결 유지 효과도 있음
 STORE_BATCH_SIZE = 100
 
 
 # =====================================================================
-# 2. Gemini 임베딩 클래스 (LangChain Embeddings 인터페이스 구현)
-# =====================================================================
-class GeminiEmbeddings(Embeddings):
-    """
-    LangChain 의 Embeddings 인터페이스를 구현한 Gemini 임베딩 래퍼.
-    - SupabaseVectorStore 가 요구하는 embed_documents / embed_query 를 제공한다.
-    - 비동기 버전(aembed_documents / aembed_query)은 LangChain 기본 구현이
-      위의 동기 함수를 스레드에서 실행해준다.
-
-    task_type 을 구분하면 검색 품질이 좋아진다.
-      - 문서 저장용 : RETRIEVAL_DOCUMENT
-      - 질문 검색용 : RETRIEVAL_QUERY
-    """
-
-    def __init__(self, api_key: str, model: str, dim: int):
-        self.client = genai.Client(api_key=api_key)
-        self.model = model
-        self.dim = dim
-
-    def _embed(self, texts: List[str], task_type: str) -> List[List[float]]:
-        """
-        Gemini 임베딩 API 호출.
-        무료 등급은 분당 요청 수 제한(429)이 있으므로 지수 백오프로 재시도한다.
-        """
-        max_retries = 5
-        for attempt in range(max_retries):
-            try:
-                res = self.client.models.embed_content(
-                    model=self.model,
-                    contents=texts,
-                    config=types.EmbedContentConfig(
-                        task_type=task_type,
-                        output_dimensionality=self.dim,
-                    ),
-                )
-                return [list(e.values) for e in res.embeddings]
-            except Exception as e:
-                msg = str(e)
-                is_rate_limit = "429" in msg or "RESOURCE_EXHAUSTED" in msg
-                if is_rate_limit and attempt < max_retries - 1:
-                    time.sleep(2 ** attempt * 2)   # 2, 4, 8, 16초 대기 후 재시도
-                    continue
-                raise
-
-    def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        """문서(청크) 여러 개 임베딩"""
-        return self._embed(texts, "RETRIEVAL_DOCUMENT")
-
-    def embed_query(self, text: str) -> List[float]:
-        """검색 질문 1개 임베딩"""
-        return self._embed([text], "RETRIEVAL_QUERY")[0]
-
-
-# =====================================================================
-# 3. 전역 객체 (지연 초기화)
+# 2. 전역 객체 (지연 초기화)
 # =====================================================================
 # 환경변수가 하나라도 빠져 있으면 서버 자체가 죽지 않도록,
 # 실제로 필요할 때(첫 요청 시) 생성해서 재사용한다.
 # → /health 는 키가 없어도 응답 가능하므로 배포 직후 상태 점검이 쉬워진다.
 _supabase: Optional[Client] = None
-_embeddings: Optional[GeminiEmbeddings] = None
+_embeddings: Optional[Any] = None   # OpenAIEmbeddings 또는 GoogleGenerativeAIEmbeddings
 _vector_store: Optional[SupabaseVectorStore] = None
 
 
@@ -158,6 +118,8 @@ def _require_env() -> None:
         name
         for name, value in {
             "GOOGLE_API_KEY": GOOGLE_API_KEY,
+            # OpenAI 키는 openai 임베딩을 쓸 때만 필수
+            **({"OPENAI_API_KEY": OPENAI_API_KEY} if EMBEDDING_PROVIDER == "openai" else {}),
             "SUPABASE_URL": SUPABASE_URL,
             "SUPABASE_KEY": SUPABASE_KEY,
         }.items()
@@ -176,13 +138,37 @@ def get_supabase() -> Client:
     return _supabase
 
 
-def get_embeddings() -> GeminiEmbeddings:
-    """Gemini 임베딩 객체 싱글톤."""
+def get_embeddings():
+    """임베딩 객체 싱글톤 (EMBEDDING_PROVIDER 에 따라 Gemini / OpenAI)."""
     global _embeddings
     if _embeddings is None:
         _require_env()
-        _embeddings = GeminiEmbeddings(api_key=GOOGLE_API_KEY, model=EMBEDDING_MODEL, dim=EMBEDDING_DIM)
+        if EMBEDDING_PROVIDER == "openai":
+            _embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL, api_key=OPENAI_API_KEY)
+        else:
+            _embeddings = GoogleGenerativeAIEmbeddings(
+                model=EMBEDDING_MODEL,
+                google_api_key=GOOGLE_API_KEY,
+                output_dimensionality=EMBEDDING_DIM,   # DB 컬럼 vector(1536) 에 맞춤
+            )
     return _embeddings
+
+
+def is_rate_limit_error(e: Exception) -> bool:
+    """429 / RESOURCE_EXHAUSTED(할당량 초과) 에러인지 판별."""
+    msg = str(e)
+    return "429" in msg or "RESOURCE_EXHAUSTED" in msg or "rate limit" in msg.lower()
+
+
+def parse_retry_delay(e: Exception, default: float = 60.0) -> float:
+    """
+    에러 메시지에서 서버가 알려준 재시도 대기 시간(초)을 꺼낸다.
+      예) "Please retry in 57.934480577s."  또는  'retryDelay': '57s'
+    못 찾으면 default(60초). 여유로 1초를 더한다.
+    """
+    msg = str(e)
+    m = re.search(r"retry in ([\d.]+)s", msg) or re.search(r"retryDelay['\"]?\s*:\s*['\"]?([\d.]+)s", msg)
+    return (float(m.group(1)) if m else default) + 1.0
 
 
 def get_vector_store() -> SupabaseVectorStore:
@@ -216,9 +202,9 @@ def make_llm(streaming: bool = False, callbacks: Optional[list] = None) -> ChatG
 
 
 # =====================================================================
-# 4. FastAPI 앱 + CORS
+# 3. FastAPI 앱 + CORS
 # =====================================================================
-app = FastAPI(title="RAG Chatbot Server", version="1.1.0")
+app = FastAPI(title="RAG Chatbot Server", version="1.0.0")
 
 # 브라우저에서 직접 fetch 로 호출하므로 CORS 를 전체 허용한다.
 # (allow_credentials=True 와 "*" 는 함께 쓸 수 없으므로 False 로 둔다)
@@ -232,7 +218,7 @@ app.add_middleware(
 
 
 # =====================================================================
-# 5. 공통 유틸: SSE 포맷 & 스트리밍 응답
+# 4. 공통 유틸: SSE 포맷 & 스트리밍 응답
 # =====================================================================
 def sse(event: str, data: Any) -> str:
     """
@@ -257,7 +243,7 @@ def sse_response(generator: AsyncGenerator[str, None]) -> StreamingResponse:
 
 
 # =====================================================================
-# 6. 요청 바디 스키마 (Pydantic)
+# 5. 요청 바디 스키마 (Pydantic)
 # =====================================================================
 class PageText(BaseModel):
     """페이지 단위 텍스트 (출처 페이지 번호를 남기기 위해 사용)"""
@@ -289,7 +275,7 @@ class QueryRequest(BaseModel):
 
 
 # =====================================================================
-# 7. GET /health
+# 6. GET /health
 # =====================================================================
 @app.get("/health")
 async def health():
@@ -300,10 +286,12 @@ async def health():
     return {
         "status": "ok",
         "llm_model": LLM_MODEL,
+        "embedding_provider": EMBEDDING_PROVIDER,
         "embedding_model": EMBEDDING_MODEL,
-        "embedding_dim": EMBEDDING_DIM,
+        "embed_rpm_limit": EMBED_RPM,
         "env": {
             "GOOGLE_API_KEY": bool(GOOGLE_API_KEY),
+            "OPENAI_API_KEY": bool(OPENAI_API_KEY),
             "SUPABASE_URL": bool(SUPABASE_URL),
             "SUPABASE_KEY": bool(SUPABASE_KEY),
         },
@@ -311,12 +299,16 @@ async def health():
 
 
 # =====================================================================
-# 8. POST /upload  (PDF → 텍스트)
+# 7. POST /upload  (PDF → 텍스트)
 # =====================================================================
 @app.post("/upload")
 async def upload(file: UploadFile = File(...)):
     """
     multipart/form-data 로 PDF 를 받아 pypdf 로 텍스트를 추출한다.
+
+    프론트 예시:
+        const fd = new FormData(); fd.append("file", pdfFile);
+        const res = await fetch(`${API}/upload`, { method: "POST", body: fd });
 
     응답:
         {
@@ -363,13 +355,14 @@ async def upload(file: UploadFile = File(...)):
 
 
 # =====================================================================
-# 9. POST /build  (청크 분할 → 임베딩 → Supabase 저장, 진행 현황 SSE)
+# 8. POST /build  (청크 분할 → 임베딩 → Supabase 저장, 진행 현황 SSE)
 # =====================================================================
 @app.post("/build")
 async def build(req: BuildRequest):
     """
     SSE 이벤트:
         event: progress  data: {"stage": "split"|"embed"|"store", "current": n, "total": N, "message": "..."}
+        event: wait      data: {"stage": "embed", "seconds": 남은초, "message": "..."}   ← 속도 제한 대기 중
         event: done      data: {"chunks": N, "message": "..."}
         event: error     data: {"message": "..."}
     """
@@ -421,16 +414,60 @@ async def build(req: BuildRequest):
                 yield sse("error", {"message": "분할된 청크가 없습니다."})
                 return
 
-            # ---------- (2) 임베딩 ----------
-            # 한 번에 전부 보내지 않고 배치로 나눠야 진행률(n/전체)을 보여줄 수 있다
+            # ---------- (2) 임베딩 (속도 제한 + 429 재시도) ----------
             embeddings = get_embeddings()
             vectors: List[List[float]] = []
-            for start in range(0, total, EMBED_BATCH_SIZE):
-                batch = docs[start:start + EMBED_BATCH_SIZE]
-                # Gemini SDK 호출은 동기 함수 → 스레드에서 실행해 이벤트 루프를 막지 않는다
-                vectors.extend(await asyncio.to_thread(
-                    embeddings.embed_documents, [d.page_content for d in batch]
-                ))
+
+            # 한 번에 보낼 개수: 분당 한도가 있으면 그 이하로 맞춘다
+            batch_size = min(EMBED_BATCH_SIZE, EMBED_RPM) if EMBED_RPM > 0 else EMBED_BATCH_SIZE
+            # 슬라이딩 윈도우: 최근 60초 동안 보낸 (시각, 개수) 기록
+            sent_log: List[tuple] = []
+
+            async def wait_with_countdown(seconds: float, reason: str):
+                """
+                seconds 만큼 기다리면서 WAIT_TICK 초마다 wait 이벤트로 남은 시간을 전송.
+                → 사용자는 멈춘 게 아니라 기다리는 중임을 알 수 있고,
+                  주기적인 전송 덕분에 중간 프록시가 유휴 연결을 끊지 않는다.
+                """
+                end = time.monotonic() + seconds
+                while (left := end - time.monotonic()) > 0:
+                    yield sse("wait", {
+                        "stage": "embed", "seconds": round(left),
+                        "message": f"{reason} — {round(left)}초 후 재개 ({len(vectors)}/{total})",
+                    })
+                    await asyncio.sleep(min(WAIT_TICK, left))
+
+            for start in range(0, total, batch_size):
+                batch = docs[start:start + batch_size]
+
+                # (a) 사전 속도 조절: 이번 배치를 보내면 60초 내 한도를 넘는지 확인
+                if EMBED_RPM > 0:
+                    now = time.monotonic()
+                    sent_log = [(t, n) for t, n in sent_log if now - t < 60]
+                    if sum(n for _, n in sent_log) + len(batch) > EMBED_RPM:
+                        # 가장 오래된 기록이 60초 창을 벗어날 때까지 대기
+                        wait_sec = 60 - (now - sent_log[0][0]) + 0.5
+                        async for ev in wait_with_countdown(wait_sec, "분당 임베딩 한도 도달, 대기 중"):
+                            yield ev
+                        sent_log = []
+
+                # (b) 임베딩 요청 + 429 발생 시 서버가 알려준 시간만큼 기다렸다 재시도
+                for attempt in range(1, EMBED_MAX_RETRIES + 1):
+                    try:
+                        result = await embeddings.aembed_documents([d.page_content for d in batch])
+                        break
+                    except Exception as e:
+                        if not is_rate_limit_error(e) or attempt == EMBED_MAX_RETRIES:
+                            raise   # 할당량 문제가 아니거나 재시도 소진 → error 이벤트로
+                        delay = parse_retry_delay(e)
+                        async for ev in wait_with_countdown(
+                            delay, f"429 할당량 초과 (재시도 {attempt}/{EMBED_MAX_RETRIES - 1})"
+                        ):
+                            yield ev
+                        sent_log = []   # 대기 후에는 윈도우가 비워진 것으로 간주
+
+                sent_log.append((time.monotonic(), len(batch)))
+                vectors.extend(result)
                 yield sse("progress", {
                     "stage": "embed", "current": len(vectors), "total": total,
                     "message": f"임베딩 중 ({len(vectors)}/{total})",
@@ -461,7 +498,7 @@ async def build(req: BuildRequest):
 
 
 # =====================================================================
-# 10. 스트리밍 콜백 핸들러
+# 9. 스트리밍 콜백 핸들러
 # =====================================================================
 class StreamHandler(BaseCallbackHandler):
     """
@@ -484,7 +521,7 @@ class StreamHandler(BaseCallbackHandler):
 
 
 # =====================================================================
-# 11. 프롬프트 정의
+# 10. 프롬프트 정의
 # =====================================================================
 # ① 질의 확장 (Query Augmentation) 프롬프트
 QUERY_AUG_SYSTEM = (
@@ -534,11 +571,20 @@ def format_docs(docs: List[Document]) -> str:
 
 
 # =====================================================================
-# 12. POST /query  (질의 확장 → 검색 → 답변 스트리밍)
+# 11. POST /query  (질의 확장 → 검색 → 답변 스트리밍)
 # =====================================================================
 @app.post("/query")
 async def query(req: QueryRequest):
     """
+    요청 바디:
+        {
+          "question": "그거 예산은 얼마야?",
+          "chat_history": [
+            {"role": "user", "content": "..."},
+            {"role": "assistant", "content": "..."}
+          ]
+        }
+
     SSE 이벤트 (순서대로):
         augmented_query : {"query": "확장된 질문"}
         sources         : [{"content": "...", "page": 3, "source": "a.pdf"}, ...]
@@ -621,9 +667,10 @@ async def query(req: QueryRequest):
 
 
 # =====================================================================
-# 13. 로컬 실행용 엔트리포인트
+# 12. 로컬 실행용 엔트리포인트
 # =====================================================================
 # Cloud Run 은 PORT 환경변수(기본 8080)로 포트를 알려준다.
+# Docker 에서는 Dockerfile 의 CMD 로 실행되지만, 로컬에서 `python main.py` 로도 띄울 수 있게 둔다.
 if __name__ == "__main__":
     import uvicorn
 
